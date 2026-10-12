@@ -11,6 +11,7 @@ from .state import (
 )
 from .tools import (
     IdempotencyKey,
+    IdempotencyReceiptLedger,
     RetryPolicy,
     ToolCall,
     ToolDefinition,
@@ -27,6 +28,7 @@ from .tools import (
 __all__ = [
     "DurableWorkflow",
     "IdempotencyKey",
+    "IdempotencyReceiptLedger",
     "InMemoryStateStore",
     "JsonStateStore",
     "PersistedWorkflowState",

@@ -8,7 +8,7 @@ from typing import Annotated, Any, Protocol
 from pydantic import BeforeValidator, Field
 
 from ..audit import AppendOnlyAuditLog
-from ..models import AuditEvent, BoundaryModel, RunRecord
+from ..models import AuditEvent, BoundaryModel, RunRecord, ToolEvent
 
 
 class WorkflowState(StrEnum):
@@ -35,6 +35,9 @@ class PersistedWorkflowState(BoundaryModel):
     completed_tools: list[str] = Field(default_factory=list)
     outputs: dict[str, Any] = Field(default_factory=dict)
     audit_events: list[AuditEvent] = Field(default_factory=list)
+    # A SUCCEEDED event intentionally appears in both structures: receipts are
+    # upsertable current state, while RunRecord.tool_events is append-only history.
+    idempotency_receipts: list[ToolEvent] = Field(default_factory=list)
 
     def audit_log(self) -> AppendOnlyAuditLog:
         return AppendOnlyAuditLog(self.audit_events)

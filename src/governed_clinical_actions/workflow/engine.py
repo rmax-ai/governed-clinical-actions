@@ -11,6 +11,9 @@ from ..models import (
     ResearchRequest,
     RunRecord,
     RunStatus,
+    ToolEvent,
+    ToolEventStatus,
+    stable_digest,
 )
 from ..provenance import (
     assert_replay_identity,
@@ -18,7 +21,14 @@ from ..provenance import (
     run_id_for,
 )
 from .state import InMemoryStateStore, PersistedWorkflowState, StateStore, WorkflowPhase
-from .tools import ToolCall, ToolGate, ToolRegistry
+from .tools import (
+    IdempotencyKey,
+    IdempotencyReceiptLedger,
+    ToolCall,
+    ToolExecutionError,
+    ToolGate,
+    ToolRegistry,
+)
 
 if TYPE_CHECKING:
     from ..llm import LLMProvider
@@ -108,6 +118,8 @@ class WorkflowEngine:
         return self.run()
 
     def run(self, max_steps: int | None = None) -> PersistedWorkflowState:
+        """Run or resume; persisted FAILED runs return unchanged and never retry."""
+
         state = self.create() if not self._has_state() else self.state_store.load(self.run_id)
         assert_replay_identity(
             state.run.replay_digest,
@@ -116,14 +128,19 @@ class WorkflowEngine:
             self.versions,
         )
         audit = state.audit_log()
-        if state.phase == WorkflowPhase.COMPLETED:
+        if state.phase in {WorkflowPhase.COMPLETED, WorkflowPhase.FAILED}:
             return state
 
         run = state.run.model_copy(
             update={"status": RunStatus.RUNNING, "state": WorkflowPhase.RUNNING}
         )
         state = state.model_copy(update={"run": run, "phase": WorkflowPhase.RUNNING})
-        gate = ToolGate(self.registry, tuple(self.plan.tool_names))
+        receipts = IdempotencyReceiptLedger(state.idempotency_receipts)
+        gate = ToolGate(
+            self.registry,
+            tuple(self.plan.tool_names),
+            receipts=receipts,
+        )
         executed_this_call = 0
 
         while state.next_step < len(self.plan.tool_names):
@@ -139,12 +156,84 @@ class WorkflowEngine:
 
             tool_name = self.plan.tool_names[state.next_step]
             call = ToolCall(name=tool_name, arguments={"request_id": self.request.request_id})
-            execution = gate.execute(
-                run_id=self.run_id,
-                call=call,
-                sequence=len(state.run.tool_events) + 1,
+            key = IdempotencyKey.for_call(self.run_id, tool_name, call.arguments)
+            receipt = receipts.get(key.value)
+            if receipt is None:
+                intent = ToolEvent(
+                    run_id=self.run_id,
+                    sequence=len(state.run.tool_events) + 1,
+                    tool_name=tool_name,
+                    idempotency_key=key.value,
+                    status=ToolEventStatus.STARTED,
+                    input_digest=stable_digest(call.arguments),
+                    attempt=1,
+                )
+                receipts.claim(key.value)
+                receipts.upsert(intent)
+            state = state.model_copy(
+                update={"idempotency_receipts": list(receipts.as_events())}
             )
+            # Persist the write-ahead receipt before a handler can perform a side effect.
+            self.state_store.save(state)
+
+            try:
+                execution = gate.execute(
+                    run_id=self.run_id,
+                    call=call,
+                    sequence=len(state.run.tool_events) + 1,
+                    idempotency_key=key,
+                )
+            except ToolExecutionError as exc:
+                event = exc.event
+                if event is None:
+                    event = ToolEvent(
+                        run_id=self.run_id,
+                        sequence=len(state.run.tool_events) + 1,
+                        tool_name=tool_name,
+                        idempotency_key=key.value,
+                        status=ToolEventStatus.FAILED,
+                        input_digest=stable_digest(call.arguments),
+                        attempt=1,
+                        error_code=exc.error_code,
+                    )
+                elif event.error_code is None:
+                    event = event.model_copy(update={"error_code": exc.error_code})
+
+                audit.record(
+                    run_id=self.run_id,
+                    event_type="tool.failed",
+                    actor="tool-gate",
+                    payload=event.model_dump(mode="json"),
+                )
+                state = state.model_copy(
+                    update={
+                        "run": state.run.model_copy(
+                            update={"tool_events": [*state.run.tool_events, event]}
+                        )
+                    }
+                )
+                failed_run = state.run.model_copy(
+                    update={
+                        "status": RunStatus.FAILED,
+                        "state": WorkflowPhase.FAILED,
+                        "error_code": exc.error_code,
+                        "audit_event_ids": list(audit.event_ids()),
+                    }
+                )
+                receipts.upsert(event)
+                state = state.model_copy(
+                    update={
+                        "run": failed_run,
+                        "phase": WorkflowPhase.FAILED,
+                        "audit_events": list(audit.events),
+                        "idempotency_receipts": list(receipts.as_events()),
+                    }
+                )
+                self.state_store.save(state)
+                raise
+
             event = execution.event
+            receipts.upsert(event)
             audit.record(
                 run_id=self.run_id,
                 event_type="tool.succeeded",
@@ -157,6 +246,7 @@ class WorkflowEngine:
                     "completed_tools": [*state.completed_tools, tool_name],
                     "outputs": {**state.outputs, tool_name: execution.output},
                     "audit_events": list(audit.events),
+                    "idempotency_receipts": list(receipts.as_events()),
                     "run": state.run.model_copy(
                         update={
                             "tool_events": [*state.run.tool_events, event],

@@ -2,6 +2,7 @@
 
 from .tools import (
     IdempotencyKey,
+    IdempotencyReceiptLedger,
     RetryPolicy,
     ToolCall,
     ToolDefinition,
@@ -17,6 +18,7 @@ from .tools import (
 
 __all__ = [
     "IdempotencyKey",
+    "IdempotencyReceiptLedger",
     "RetryPolicy",
     "ToolCall",
     "ToolDefinition",

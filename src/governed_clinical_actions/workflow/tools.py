@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,25 +15,80 @@ class ToolError(RuntimeError):
     """Base error for typed tool execution."""
 
 
-class ToolNotFoundError(ToolError):
-    """Raised when a plan requests an unregistered tool."""
-
-
-class ToolEnforcementError(ToolError):
-    """Raised when a call does not pass the deterministic tool gate."""
-
-
-class ToolInputError(ToolError):
-    """Raised when a tool input cannot be validated by its declared type."""
-
-
 class ToolExecutionError(ToolError):
     """Raised when a handler fails after input validation."""
 
-    def __init__(self, tool_name: str, message: str, *, retryable: bool = False):
+    def __init__(
+        self,
+        tool_name: str,
+        message: str,
+        *,
+        error_code: str,
+        event: ToolEvent | None = None,
+        retryable: bool = False,
+    ):
         self.tool_name = tool_name
+        self.error_code = error_code
+        self.event = event
         self.retryable = retryable
         super().__init__(message)
+
+
+class ToolNotFoundError(ToolExecutionError):
+    """Raised when a plan requests an unregistered tool."""
+
+    def __init__(self, message: str, *, tool_name: str = "<unknown>"):
+        super().__init__(
+            tool_name,
+            message,
+            error_code=_stable_error_code(self),
+        )
+
+
+class ToolEnforcementError(ToolExecutionError):
+    """Raised when a call does not pass the deterministic tool gate."""
+
+    def __init__(self, message: str, *, tool_name: str = "<unknown>"):
+        super().__init__(
+            tool_name,
+            message,
+            error_code=_stable_error_code(self),
+        )
+
+
+class ToolInputError(ToolExecutionError):
+    """Raised when a tool input cannot be validated by its declared type."""
+
+    def __init__(self, message: str, *, tool_name: str = "<unknown>"):
+        super().__init__(
+            tool_name,
+            message,
+            error_code=_stable_error_code(self),
+        )
+
+
+def _stable_error_code(
+    error: Exception | None = None,
+    *,
+    failure_kind: str | None = None,
+) -> str:
+    """Map tool failure paths to the closed, stable error-code vocabulary."""
+
+    if failure_kind == "output_validation":
+        return "tool.output_invalid"
+    if failure_kind == "idempotency_ambiguous":
+        return "tool.idempotency_ambiguous"
+    if failure_kind == "idempotency_replay_unavailable":
+        return "tool.idempotency_replay_unavailable"
+    if isinstance(error, ToolInputError):
+        return "tool.input_invalid"
+    if isinstance(error, ToolNotFoundError):
+        return "tool.not_found"
+    if isinstance(error, ToolEnforcementError):
+        return "tool.enforcement_denied"
+    if isinstance(error, ToolExecutionError):
+        return error.error_code
+    return "tool.handler_error"
 
 
 @dataclass(frozen=True)
@@ -47,12 +102,18 @@ class RetryPolicy:
         if self.max_attempts < 1:
             raise ValueError("max_attempts must be at least one")
 
-    def should_retry(self, error: Exception, attempt: int) -> bool:
+    def should_retry(
+        self,
+        error: Exception,
+        attempt: int,
+        *,
+        error_code: str | None = None,
+    ) -> bool:
         if attempt >= self.max_attempts:
             return False
         if isinstance(error, ToolExecutionError):
-            return error.retryable or error.tool_name in self.retryable_error_codes
-        return type(error).__name__ in self.retryable_error_codes
+            return error.retryable or (error.error_code or "") in self.retryable_error_codes
+        return (error_code or type(error).__name__) in self.retryable_error_codes
 
 
 @dataclass(frozen=True)
@@ -67,6 +128,40 @@ class IdempotencyKey:
 
     def __str__(self) -> str:
         return self.value
+
+
+class IdempotencyReceiptLedger:
+    """Current receipt per idempotency key, preserving first-seen key order."""
+
+    def __init__(
+        self,
+        receipts: Iterable[ToolEvent] = (),
+        *,
+        owned: Iterable[str] = (),
+    ) -> None:
+        self._key_order: list[str] = []
+        self._receipts: dict[str, ToolEvent] = {}
+        self._owned = set(owned)
+        for event in receipts:
+            self.upsert(event)
+
+    def get(self, key: str) -> ToolEvent | None:
+        return self._receipts.get(key)
+
+    def upsert(self, event: ToolEvent) -> None:
+        key = event.idempotency_key
+        if key not in self._receipts:
+            self._key_order.append(key)
+        self._receipts[key] = event
+
+    def as_events(self) -> tuple[ToolEvent, ...]:
+        return tuple(self._receipts[key] for key in self._key_order)
+
+    def owns(self, key: str) -> bool:
+        return key in self._owned
+
+    def claim(self, key: str) -> None:
+        self._owned.add(key)
 
 
 @dataclass(frozen=True)
@@ -94,7 +189,10 @@ class ToolDefinition[InputT, OutputT]:
                 return self.input_type.model_validate(raw)  # type: ignore[return-value, attr-defined]
             return TypeAdapter(self.input_type).validate_python(raw)
         except Exception as exc:
-            raise ToolInputError(f"Invalid input for tool {self.name!r}") from exc
+            raise ToolInputError(
+                f"Invalid input for tool {self.name!r}",
+                tool_name=self.name,
+            ) from exc
 
     def validate_output(self, value: OutputT) -> OutputT:
         if self.output_type is None:
@@ -105,7 +203,9 @@ class ToolDefinition[InputT, OutputT]:
             return TypeAdapter(self.output_type).validate_python(value)
         except Exception as exc:
             raise ToolExecutionError(
-                self.name, f"Tool {self.name!r} returned an invalid output"
+                self.name,
+                f"Tool {self.name!r} returned an invalid output",
+                error_code=_stable_error_code(exc, failure_kind="output_validation"),
             ) from exc
 
 
@@ -129,6 +229,7 @@ class ToolRegistry:
 
     def __init__(self):
         self._definitions: dict[str, ToolDefinition[Any, Any]] = {}
+        # This in-process output cache is explicitly NOT the durability boundary.
         self._cache: dict[str, ToolExecution[Any]] = {}
 
     def register(
@@ -161,7 +262,10 @@ class ToolRegistry:
         try:
             return self._definitions[name]
         except KeyError as exc:
-            raise ToolNotFoundError(f"Tool {name!r} is not registered") from exc
+            raise ToolNotFoundError(
+                f"Tool {name!r} is not registered",
+                tool_name=name,
+            ) from exc
 
     def invoke(self, *args: Any, **kwargs: Any) -> None:
         """Reject direct invocation, including from an LLM adapter."""
@@ -179,27 +283,86 @@ class ToolRegistry:
         arguments: Mapping[str, Any],
         sequence: int,
         idempotency_key: IdempotencyKey,
+        receipts: IdempotencyReceiptLedger | None,
     ) -> ToolExecution[Any]:
         if not authority.gate_id:
-            raise ToolEnforcementError("Missing tool-gate authority")
-        definition = self.get(tool_name)
-        cached = self._cache.get(idempotency_key.value)
-        if cached is not None:
-            return ToolExecution(
-                output=cached.output,
-                event=cached.event,
-                idempotent_replay=True,
+            raise ToolEnforcementError(
+                "Missing tool-gate authority",
+                tool_name=tool_name,
             )
 
+        if receipts is not None:
+            receipt = receipts.get(idempotency_key.value)
+            if receipt is not None and receipt.status == ToolEventStatus.SUCCEEDED:
+                cached = self._cache.get(idempotency_key.value)
+                if cached is not None:
+                    return ToolExecution(
+                        output=cached.output,
+                        event=cached.event,
+                        idempotent_replay=True,
+                    )
+                raise ToolExecutionError(
+                    tool_name,
+                    f"Output for completed tool {tool_name!r} is unavailable",
+                    error_code=_stable_error_code(
+                        failure_kind="idempotency_replay_unavailable"
+                    ),
+                )
+            if receipt is not None and receipt.status == ToolEventStatus.FAILED:
+                raise ToolExecutionError(
+                    tool_name,
+                    f"Tool {tool_name!r} has a persisted failed receipt",
+                    error_code=receipt.error_code or _stable_error_code(),
+                    event=receipt,
+                )
+            if (
+                receipt is not None
+                and receipt.status == ToolEventStatus.STARTED
+                and not receipts.owns(idempotency_key.value)
+            ):
+                raise ToolExecutionError(
+                    tool_name,
+                    f"Tool {tool_name!r} has an ambiguous started receipt",
+                    error_code=_stable_error_code(failure_kind="idempotency_ambiguous"),
+                )
+
+        definition = self.get(tool_name)
+
+        if receipts is None:
+            cached = self._cache.get(idempotency_key.value)
+            if cached is not None:
+                return ToolExecution(
+                    output=cached.output,
+                    event=cached.event,
+                    idempotent_replay=True,
+                )
+
         typed_input = definition.validate_input(arguments)
+        input_digest = stable_digest(arguments)
         attempt = 0
         while True:
             attempt += 1
-            input_digest = stable_digest(typed_input)
+            if receipts is not None:
+                receipts.upsert(
+                    ToolEvent(
+                        run_id=run_id,
+                        sequence=sequence,
+                        tool_name=tool_name,
+                        idempotency_key=idempotency_key.value,
+                        status=ToolEventStatus.STARTED,
+                        input_digest=input_digest,
+                        attempt=attempt,
+                    )
+                )
             try:
                 output = definition.validate_output(definition.handler(typed_input))
             except Exception as exc:
-                if definition.retry_policy.should_retry(exc, attempt):
+                error_code = _stable_error_code(exc)
+                if definition.retry_policy.should_retry(
+                    exc,
+                    attempt,
+                    error_code=error_code,
+                ):
                     continue
                 event = ToolEvent(
                     run_id=run_id,
@@ -209,11 +372,15 @@ class ToolRegistry:
                     status=ToolEventStatus.FAILED,
                     input_digest=input_digest,
                     attempt=attempt,
-                    error_code=type(exc).__name__,
+                    error_code=error_code,
                 )
+                if receipts is not None:
+                    receipts.upsert(event)
                 raise ToolExecutionError(
                     tool_name,
                     f"Tool {tool_name!r} failed on attempt {attempt}",
+                    error_code=error_code,
+                    event=event,
                 ) from exc
             event = ToolEvent(
                 run_id=run_id,
@@ -226,18 +393,28 @@ class ToolRegistry:
                 attempt=attempt,
             )
             result = ToolExecution(output=output, event=event)
+            if receipts is not None:
+                receipts.upsert(event)
             self._cache[idempotency_key.value] = result
             return result
+
 
 
 class ToolGate:
     """The only execution boundary available to a workflow."""
 
-    def __init__(self, registry: ToolRegistry, allowed_tools: tuple[str, ...] | None = None):
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        allowed_tools: tuple[str, ...] | None = None,
+        *,
+        receipts: IdempotencyReceiptLedger | None = None,
+    ):
         self._registry = registry
         self._allowed_tools = frozenset(
             allowed_tools if allowed_tools is not None else registry.names()
         )
+        self._receipts = receipts
         self._authority = _GateAuthority(gate_id=f"gate_{id(self)}")
 
     @property
@@ -254,7 +431,8 @@ class ToolGate:
     ) -> ToolExecution[Any]:
         if call.name not in self._allowed_tools:
             raise ToolEnforcementError(
-                f"Tool {call.name!r} is not authorized by the execution plan"
+                f"Tool {call.name!r} is not authorized by the execution plan",
+                tool_name=call.name,
             )
         key = idempotency_key or IdempotencyKey.for_call(run_id, call.name, call.arguments)
         return self._registry._execute(
@@ -264,4 +442,5 @@ class ToolGate:
             arguments=call.arguments,
             sequence=sequence,
             idempotency_key=key,
+            receipts=self._receipts,
         )
